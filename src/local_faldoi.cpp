@@ -45,6 +45,216 @@ extern "C" {
 #include "parameters.h"
 #include <ctime>
 
+#include <opencv2/opencv.hpp>
+
+#define N 4  // Temporal window size
+
+class VideoDenoiser {
+private:
+    int m_height;
+    int m_width;
+    int m_frameNum;
+    std::vector<cv::Mat> m_frames;
+    std::vector<cv::Mat> dst;
+    std::vector<cv::Mat> map_X, map_Y;
+    std::vector<cv::Mat> temp_map_X, temp_map_Y;
+    cv::Mat m_Counter_adder;
+    cv::Mat formatX, formatY;
+
+public:
+    VideoDenoiser(const std::vector<cv::Mat>& frames) {
+        m_frames = frames;
+        m_frameNum = frames.size();
+        m_height = frames[0].rows;
+        m_width = frames[0].cols;
+        
+        // Initialize matrices
+        dst.resize(m_frameNum);
+        map_X.resize(m_frameNum - 1);
+        map_Y.resize(m_frameNum - 1);
+        temp_map_X.resize(2 * N);
+        temp_map_Y.resize(2 * N);
+        
+        for(int i = 0; i < m_frameNum; i++) {
+            dst[i].create(m_height, m_width, CV_8UC3);
+        }
+        
+        for(int i = 0; i < m_frameNum - 1; i++) {
+            map_X[i].create(m_height, m_width, CV_32F);
+            map_Y[i].create(m_height, m_width, CV_32F);
+        }
+        
+        for(int i = 0; i < 2 * N; i++) {
+            temp_map_X[i].create(m_height, m_width, CV_32F);
+            temp_map_Y[i].create(m_height, m_width, CV_32F);
+            temp_map_X[i].setTo(1);
+            temp_map_Y[i].setTo(1);
+        }
+        
+        m_Counter_adder = cv::Mat::ones(m_height, m_width, CV_32F);
+        
+        // Initialize coordinate matrices
+        formatX = cv::Mat::zeros(m_height, m_width, CV_32F);
+        formatY = cv::Mat::zeros(m_height, m_width, CV_32F);
+        for(int i = 0; i < m_height; i++) {
+            for(int j = 0; j < m_width; j++) {
+                formatX.at<float>(i,j) = j;
+                formatY.at<float>(i,j) = i;
+            }
+        }
+    }
+    
+    void motionEstimation() {
+        cv::Ptr<cv::DenseOpticalFlow> flow = cv::DISOpticalFlow::create(cv::DISOpticalFlow::PRESET_MEDIUM);
+        
+        for(int i = 1; i < m_frameNum; i++) {
+            cv::Mat flow_mat;
+            cv::Mat prev_gray, curr_gray;
+            
+            cv::cvtColor(m_frames[i-1], prev_gray, cv::COLOR_BGR2GRAY);
+            cv::cvtColor(m_frames[i], curr_gray, cv::COLOR_BGR2GRAY);
+            
+            flow->calc(prev_gray, curr_gray, flow_mat);
+            
+            std::vector<cv::Mat> flow_parts;
+            cv::split(flow_mat, flow_parts);
+            
+            flow_parts[0].copyTo(map_X[i-1]);
+            flow_parts[1].copyTo(map_Y[i-1]);
+            
+            std::cout << "Computed flow for frame " << i-1 << " -> " << i << std::endl;
+        }
+    }
+    
+    void absoluteMotion(int reference) {
+        // Compute absolute motion for frames before reference
+        for(int i = reference - N, k = 0; i < reference && k < N; i++, k++) {
+            if(i >= 0) {
+                temp_map_X[k] = map_X[i];
+                temp_map_Y[k] = map_Y[i];
+                for(int j = i + 1; j < reference; j++) {
+                    temp_map_X[k] += map_X[j];
+                    temp_map_Y[k] += map_Y[j];
+                }
+            }
+        }
+        
+        // Compute absolute motion for frames after reference
+        for(int i = reference + N - 1, k = 2 * N - 1; i >= reference && k >= N; i--, k--) {
+            if(i < m_frames.size() - 1) {
+                temp_map_X[k] = -map_X[i];
+                temp_map_Y[k] = -map_Y[i];
+                for(int j = i - 1; j >= reference; j--) {
+                    temp_map_X[k] -= map_X[j];
+                    temp_map_Y[k] -= map_Y[j];
+                }
+            }
+        }
+    }
+    
+    void buildTargetFrame(int reference, cv::Mat& dst) {
+        cv::Mat dst_temp;
+        m_frames[reference].convertTo(dst_temp, CV_32FC3);
+        cv::Mat counter = cv::Mat::ones(m_height, m_width, CV_32F);
+        
+        // Process frames before reference
+        for(int k = reference - N, m = 0; k < reference && m < N; k++, m++) {
+            if(k >= 0) {
+                cv::Mat mapedX = temp_map_X[m] + formatX;
+                cv::Mat mapedY = temp_map_Y[m] + formatY;
+                cv::Mat warped;
+                
+                cv::remap(m_frames[k], warped, mapedX, mapedY, cv::INTER_LINEAR);
+                
+                for(int i = 0; i < m_height; i++) {
+                    for(int j = 0; j < m_width; j++) {
+                        cv::Vec3b ref_pixel = m_frames[reference].at<cv::Vec3b>(i,j);
+                        cv::Vec3b warped_pixel = warped.at<cv::Vec3b>(i,j);
+                        
+                        // Compute color difference
+                        int R = std::abs(ref_pixel[0] - warped_pixel[0]);
+                        int G = std::abs(ref_pixel[1] - warped_pixel[1]);
+                        int B = std::abs(ref_pixel[2] - warped_pixel[2]);
+                        int Y = (R + 2*G + B) / 4;
+                        
+                        float weight = Y > 40 ? 0.0f : 1.0f;
+                        
+                        dst_temp.at<cv::Vec3f>(i,j)[0] += weight * warped_pixel[0];
+                        dst_temp.at<cv::Vec3f>(i,j)[1] += weight * warped_pixel[1];
+                        dst_temp.at<cv::Vec3f>(i,j)[2] += weight * warped_pixel[2];
+                        counter.at<float>(i,j) += weight;
+                    }
+                }
+            }
+        }
+        
+        // Process frames after reference
+        for(int k = reference + 1, m = N; k <= reference + N && m < 2*N; k++, m++) {
+            if(k < m_frameNum) {
+                cv::Mat mapedX = temp_map_X[m] + formatX;
+                cv::Mat mapedY = temp_map_Y[m] + formatY;
+                cv::Mat warped;
+                
+                cv::remap(m_frames[k], warped, mapedX, mapedY, cv::INTER_LINEAR);
+                
+                for(int i = 0; i < m_height; i++) {
+                    for(int j = 0; j < m_width; j++) {
+                        cv::Vec3b ref_pixel = m_frames[reference].at<cv::Vec3b>(i,j);
+                        cv::Vec3b warped_pixel = warped.at<cv::Vec3b>(i,j);
+                        
+                        int R = std::abs(ref_pixel[0] - warped_pixel[0]);
+                        int G = std::abs(ref_pixel[1] - warped_pixel[1]);
+                        int B = std::abs(ref_pixel[2] - warped_pixel[2]);
+                        int Y = (R + 2*G + B) / 4;
+                        
+                        float weight = Y > 40 ? 0.0f : 1.0f;
+                        
+                        dst_temp.at<cv::Vec3f>(i,j)[0] += weight * warped_pixel[0];
+                        dst_temp.at<cv::Vec3f>(i,j)[1] += weight * warped_pixel[1];
+                        dst_temp.at<cv::Vec3f>(i,j)[2] += weight * warped_pixel[2];
+                        counter.at<float>(i,j) += weight;
+                    }
+                }
+            }
+        }
+        
+        // Normalize
+        for(int i = 0; i < m_height; i++) {
+            for(int j = 0; j < m_width; j++) {
+                float c = counter.at<float>(i,j);
+                if(c > 0) {
+                    dst_temp.at<cv::Vec3f>(i,j) /= c;
+                }
+            }
+        }
+        
+        dst_temp.convertTo(dst, CV_8UC3);
+    }
+    
+    void execute() {
+        clock_t start = clock();
+        
+        std::cout << "Starting motion estimation..." << std::endl;
+        motionEstimation();
+        
+        std::cout << "Processing frames..." << std::endl;
+        for(int i = 0; i < m_frameNum; i++) {
+            std::cout << "Processing frame " << i << "/" << m_frameNum << std::endl;
+            absoluteMotion(i);
+            buildTargetFrame(i, dst[i]);
+            m_Counter_adder.setTo(1);
+        }
+        
+        clock_t end = clock();
+        double time_per_frame = double(end - start) / CLOCKS_PER_SEC / m_frameNum;
+        std::cout << "Average processing time per frame: " << time_per_frame << " seconds" << std::endl;
+    }
+    
+    const std::vector<cv::Mat>& getDenoisedFrames() const {
+        return dst;
+    }
+};
+
 using namespace std;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -625,6 +835,7 @@ inline void copy_fixed_coordinates(OpticalFlowData *ofD, const float *out, const
         }
     }
 }
+
 
 
 /**
@@ -1977,4 +2188,5 @@ int main(int argc, char *argv[]) {
     cerr << "Finishing date: " << ctime(&tt);
     return 0;
 }
-#endif
+
+#endif  // LOCAL_FALDOI
